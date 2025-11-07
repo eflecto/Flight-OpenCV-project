@@ -103,50 +103,14 @@ def merge_collinear_segments(segments: Iterable[Tuple[float, float, float, float
     return merged_segments
 
 
-def _point_segment_distance(px: float, py: float, seg: tuple[float, float, float, float]) -> float:
-    x1, y1, x2, y2 = seg
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return math.hypot(px - x1, py - y1)
-    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
-    t = max(0.0, min(1.0, t))
-    proj_x = x1 + t * dx
-    proj_y = y1 + t * dy
-    return math.hypot(px - proj_x, py - proj_y)
-
-
-def _extend_segment(seg: tuple[float, float, float, float], extend: float) -> tuple[float, float, float, float]:
-    if extend <= 0:
-        return seg
-    x1, y1, x2, y2 = seg
-    dx = x2 - x1
-    dy = y2 - y1
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return seg
-    ex = extend * dx / length
-    ey = extend * dy / length
-    return (x1 - ex, y1 - ey, x2 + ex, y2 + ey)
-
-
-def _segment_length(seg: tuple[float, float, float, float]) -> float:
-    x1, y1, x2, y2 = seg
-    return math.hypot(x2 - x1, y2 - y1)
-
-
-def intersection_point(seg1: tuple[float, float, float, float],
-                       seg2: tuple[float, float, float, float],
-                       eps: float = 1e-9,
-                       gap_tol: float = 0.0,
-                       extend: float = 0.0) -> tuple[float, float] | None:
+def intersection_point(seg1: tuple[float, float, float, float], seg2: tuple[float, float, float, float], eps: float = 1e-9) -> tuple[float, float] | None:
     """
     Возвращает точку пересечения (x,y) если отрезки пересекаются (включая в концевых точках),
     иначе None.
     seg = (x1,y1,x2,y2) - могут быть float
     """
-    x1, y1, x2, y2 = _extend_segment(seg1, extend)
-    x3, y3, x4, y4 = _extend_segment(seg2, extend)
+    x1, y1, x2, y2 = seg1
+    x3, y3, x4, y4 = seg2
 
     # Решение векторно: p + t r  and q + u s
     r: tuple[float, float] = (x2 - x1, y2 - y1)
@@ -162,54 +126,53 @@ def intersection_point(seg1: tuple[float, float, float, float],
     t: float = (q_p[0] * s[1] - q_p[1] * s[0]) / r_cross_s
     u: float = (q_p[0] * r[1] - q_p[1] * r[0]) / r_cross_s
 
-    ix: float = x1 + t * r[0]
-    iy: float = y1 + t * r[1]
 
     tol: float = 1e-7
     if -tol <= t <= 1 + tol and -tol <= u <= 1 + tol:
+        ix: float = x1 + t * r[0]
+        iy: float = y1 + t * r[1]
         return (ix, iy)
-    if gap_tol > 0.0:
-        if (_point_segment_distance(ix, iy, seg1) <= gap_tol and
-                _point_segment_distance(ix, iy, seg2) <= gap_tol):
-            return (ix, iy)
     return None
 
 
 def cluster_points(points: Iterable[Tuple[float, float]], cluster_dist: float = 10.0) -> list[Tuple[float, float]]:
-    if cluster_dist <= 0:
-        return list(points)
-    clusters: list[list[float]] = []  # [cx, cy, count]
-    dist_sq = float(cluster_dist) * float(cluster_dist)
+    """
+    Простое дедуплирование точек с привязкой к сетке (grid-based), чтобы не слипались
+    близкие, но разные вершины. Возвращает по одной точке на ячейку.
+    """
+    if not points:
+        return []
+    bin_size = max(1.0, float(cluster_dist))
+    bins: dict[tuple[int, int], list[Tuple[float, float]]] = {}
     for (x, y) in points:
-        placed = False
-        for cluster in clusters:
-            cx, cy, count = cluster
-            if (x - cx) ** 2 + (y - cy) ** 2 <= dist_sq:
-                new_count = count + 1
-                cluster[0] = (cx * count + x) / new_count
-                cluster[1] = (cy * count + y) / new_count
-                cluster[2] = new_count
-                placed = True
-                break
-        if not placed:
-            clusters.append([x, y, 1])
-    return [(float(cx), float(cy)) for cx, cy, _ in clusters]
+        bx = int(round(x / bin_size))
+        by = int(round(y / bin_size))
+        bins.setdefault((bx, by), []).append((x, y))
+    centers: list[Tuple[float, float]] = []
+    for pts in bins.values():
+        sx = 0.0
+        sy = 0.0
+        for (x, y) in pts:
+            sx += x
+            sy += y
+        n = float(len(pts))
+        centers.append((sx / n, sy / n))
+    return centers
 
 
 def count_intersections(image_path: str,
                         canny_thresh1=50, canny_thresh2=150,
                         hough_threshold=40, minLineLength=0, maxLineGap=10,
                         angle_merge_deg=5.0, rho_merge_px=20.0,
-                        cluster_dist=14.0,
+                        cluster_dist=6.0,
                         visualize=True,
                         out_vis_path="intersections_vis.png",
                         apply_clahe=True,
                         apply_blur=True,
                         use_auto_scaling=True,
                         auto_base_diag=1500.0,
-                        segment_extend_px=6.0,
-                        gap_tol_px=10.0,
-                        gap_tol_ratio=0.18,
+                        segment_extend_px=10.0,
+                        near_parallel_deg=2.0,
                         return_raw_points=False):
     img: np.ndarray | None = cv2.imread(image_path)
     if img is None:
@@ -235,13 +198,11 @@ def count_intersections(image_path: str,
         # Если minLineLength не задан (0), подбераю от размера изображения
         scaled_min_line_length: int = int(max(minLineLength, 0.05 * max(h, w)))
         scaled_segment_extend: float = float(segment_extend_px) * scale
-        scaled_gap_tol: float = float(gap_tol_px) * scale
     else:
         scaled_cluster_dist: float = cluster_dist
         scaled_rho_merge: float = rho_merge_px
         scaled_min_line_length: int = minLineLength
         scaled_segment_extend: float = segment_extend_px
-        scaled_gap_tol: float = gap_tol_px
 
     lines = cv2.HoughLinesP(edges,
                             rho=1,
@@ -260,15 +221,13 @@ def count_intersections(image_path: str,
     merged: list[tuple[float, float, float, float]] = merge_collinear_segments(segments,
                                       angle_thresh_deg=angle_merge_deg,
                                       rho_thresh=scaled_rho_merge,
-                                      extend_px=0.0)
+                                      extend_px=scaled_segment_extend)
 
     pts: list[tuple[float, float]] = []
+    near_parallel_rad: float = math.radians(near_parallel_deg)
     for a, b in combinations(merged, 2):
-        gap_tol = max(scaled_gap_tol,
-                      gap_tol_ratio * min(_segment_length(a), _segment_length(b)))
-        p: tuple[float, float] | None = intersection_point(a, b,
-                                                          gap_tol=gap_tol,
-                                                          extend=scaled_segment_extend)
+        # Не отбрасываем пары заранее по углу: сначала считаем пересечение
+        p: tuple[float, float] | None = intersection_point(a, b)
         if p is not None:
             pts.append(p)
 
@@ -287,3 +246,22 @@ def count_intersections(image_path: str,
         return len(clustered), merged, clustered, pts # type: ignore
     return len(clustered), merged, clustered # type: ignore
 
+
+if __name__ == "__main__":
+    img_path = "Examples/example5.png"
+    cnt, merged_segments, intersections = count_intersections(img_path,
+                                                               canny_thresh1=50,
+                                                               canny_thresh2=150,
+                                                               hough_threshold=40,
+                                                               minLineLength=30,
+                                                               maxLineGap=10,
+                                                               angle_merge_deg=5.0,
+                                                               rho_merge_px=20.0,
+                                                               cluster_dist=12.0,
+                                                               visualize=False,
+                                                               apply_clahe=True,
+                                                               apply_blur=True,
+                                                               use_auto_scaling=True,
+                                                               auto_base_diag=1000.0,
+                                                               near_parallel_deg=2.0)
+    print(cnt) # type: ignore   
