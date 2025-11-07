@@ -177,7 +177,7 @@ def intersection_point(seg1: tuple[float, float, float, float],
 
 def cluster_points(points: Iterable[Tuple[float, float]], cluster_dist: float = 10.0) -> list[Tuple[float, float]]:
     if cluster_dist <= 0:
-        return list(points)
+        return list[Tuple[float, float]](points)
     clusters: list[list[float]] = []  # [cx, cy, count]
     dist_sq = float(cluster_dist) * float(cluster_dist)
     for (x, y) in points:
